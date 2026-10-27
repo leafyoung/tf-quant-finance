@@ -15,6 +15,36 @@
 (top_k TF tie-break, convert_to_tensor Python-scalar dtype inference) were
 reverted after causing andersen_lake regressions (documented below).
 
+## Cross-check fix (2026-10-27): American CRR discount order
+
+`black_scholes/crr_binomial_tree.py` applied the American early-exercise max
+BEFORE discounting (`max(continuation, intrinsic)·e^{−r·dt}`), understating the
+exercise condition and under-pricing American options (root-caused via the
+cross-check suite: ~5e-4 low on an ATM 1y put vs torchquantlib/QuantLib).
+Fixed to the standard `max(continuation·e^{−r·dt}, intrinsic)`; European prices
+are unaffected (the exercise modifier is the identity for them).
+
+`crr_binomial_tree_test.py` expectations updated for the American entries —
+the old values encoded the buggy order. Each new value verified against an
+independent pure-Python classic-CRR reference (agree to all printed digits);
+entries where early exercise is worthless (e.g. the 0.0098847 call) were
+confirmed unchanged:
+- ZeroRank / BatchShapeWithBroadcast idx2: 0.41299509 → 0.41300900
+- BatchShapeWithBroadcast idx4: 0.06046989 → 0.06049013
+- BatchRank1 idx2: 0.30367994 → 0.30398377
+- BatchRank2: row1 idx2 0.303679→0.303984, idx4 1.110733→1.110734;
+  row2 idx0 0.009376→0.009380, idx1 0.472969→0.472986, idx4 0.856245→0.856415
+`black_scholes/` module: 143 passed after the fix. `andersen_lake_test.py`
+computes its tree reference dynamically (self-adjusting); `pricing_platform`
+tests are never run (GPU crash rule).
+
+Post-fix full suite (same config as verify_run8): **12 failed, 1344 passed,
+1 deselected** (75 min) — one better than the 13/1343 baseline. The failing
+names visible in the output plus a targeted rerun of the known-flaky modules
+(11 failures reproduced across holiday_calendar / hagan_west / CG /
+integration / hull_white calibration+swaption) are all in the pre-existing
+triaged categories below — none touch `crr_binomial_tree` or its consumers.
+
 ## Remaining 13 failures (triaged, verified)
 
 - **PSEUDO RNG noise (~7)** — lsm basket/american/v2, joined hull_white,

@@ -36,7 +36,7 @@ class BinomialModelPrice(parameterized.TestCase, tf.test.TestCase):
           'discount_rates': 0.035,
           'dividend_rates': 0.07,
           'expiries': 1.0,
-          'expected': 0.41299509,
+          'expected': 0.41300900,
           'dtype': np.float64
       }, {
           'testcase_name': 'BatchShapeWithBroadcast',
@@ -48,7 +48,7 @@ class BinomialModelPrice(parameterized.TestCase, tf.test.TestCase):
           'discount_rates': 0.035,
           'dividend_rates': [0.02, 0.0, 0.07, 0.01, 0.0],
           'expiries': 1.0,
-          'expected': [0.0, 0.0098847, 0.41299509, 0.0, 0.06046989],
+          'expected': [0.0, 0.0098847, 0.41300900, 0.0, 0.06049013],
           'dtype': np.float64
       }, {
           'testcase_name': 'BatchRank1',
@@ -60,7 +60,7 @@ class BinomialModelPrice(parameterized.TestCase, tf.test.TestCase):
           'discount_rates': [0.035, 0.01, 0.1, 0.01, 0.0],
           'dividend_rates': [0.02, 0.0, 0.07, 0.01, 0.0],
           'expiries': [0.5, 1.0, 1.0, 0.1, 2.0],
-          'expected': [0.03160387, 0.1682701, 0.30367994, 0.0, 1.11073385],
+          'expected': [0.03160387, 0.1682701, 0.30398377, 0.0, 1.11073385],
           'dtype': np.float32
       }, {
           'testcase_name': 'BatchRank2',
@@ -80,8 +80,8 @@ class BinomialModelPrice(parameterized.TestCase, tf.test.TestCase):
                              [0.01, 0.01, 0.07, 0.01, 0.0]],
           'expiries': [[0.5, 1.0, 1.0, 0.1, 2.0],
                        [1.5, 1.5, 1.0, 0.5, 2.0]],
-          'expected': [[0.031603, 0.16827, 0.303679, 0.0, 1.110733],
-                       [0.009376, 0.472969, 0.337524, 1.309396, 0.856245]],
+          'expected': [[0.031603, 0.16827, 0.303984, 0.0, 1.110734],
+                       [0.009380, 0.472986, 0.337524, 1.309396, 0.856415]],
           'dtype': np.float32
       }, {
           'testcase_name': 'Expiration',

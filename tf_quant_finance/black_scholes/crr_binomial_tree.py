@@ -181,11 +181,14 @@ def option_price_binomial(*,
       # step; pad back to full width so the JAX carry shape stays static. The
       # padded/inactive columns are never read by the (shrinking) active region.
       current_values, current_log_spot_grid = carry
-      next_values = (current_values[..., 1:] * p_dn
-                     + current_values[..., :-1] * p_up)
+      # Continuation value discounted to the current node before comparing
+      # with the immediate-exercise value; comparing pre-discount understates
+      # the exercise condition and under-prices American options.
+      next_values = discount_factors * (
+          current_values[..., 1:] * p_dn
+          + current_values[..., :-1] * p_up)
       next_log_spot_grid = current_log_spot_grid[..., :-1] - ln_up
       next_values = value_mod_fn(next_values, tf.math.exp(next_log_spot_grid))
-      next_values = discount_factors * next_values
       pad = tf.zeros(next_values.shape[:-1] + (1,), dtype=next_values.dtype)
       next_values = tf.concat([next_values, pad], -1)
       next_log_spot_grid = tf.concat([next_log_spot_grid, pad], -1)
