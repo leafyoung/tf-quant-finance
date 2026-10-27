@@ -603,7 +603,10 @@ def binary_price(*,
       forwards = tf.convert_to_tensor(forwards, dtype=dtype, name='forwards')
     else:
       spots = tf.convert_to_tensor(spots, dtype=dtype, name='spots')
-      forwards = spots / discount_factors
+      # Forward must include the dividend yield: F = S e^{(r-q)T}. The
+      # dividend rate is an accepted argument of this function; ignoring it
+      # over-prices binary calls (and under-prices puts) when q > 0.
+      forwards = spots * tf.exp(-dividend_rates * expiries) / discount_factors
 
     sqrt_var = volatilities * _safe_sqrt(expiries)
 

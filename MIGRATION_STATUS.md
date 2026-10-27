@@ -45,6 +45,18 @@ names visible in the output plus a targeted rerun of the known-flaky modules
 integration / hull_white calibration+swaption) are all in the pre-existing
 triaged categories below — none touch `crr_binomial_tree` or its consumers.
 
+## Cross-check fix (2026-10-28): binary_price ignored dividend yield
+
+`black_scholes/vanilla_prices.py::binary_price` accepted `dividend_rates` but
+never used it: when priced from `spots`, the forward was `S·e^{rT}` instead of
+`S·e^{(r−q)T}`, over-pricing binary calls (ATM 1y: 0.5323 vs correct
+0.4946 at q=2%). Fixed to `spots·e^{−qT}/DF`. Root-caused via the cross-check
+suite (QuantLib CashOrNothingPayoff golden); verified against an independent
+closed-form reference. Existing binary tests all pass explicit `forwards`, so
+they never exercised the spots path — unchanged and green (black_scholes
+module: 143 passed). Found and fixed during the tf-quant↔QuantLib deep
+cross-check (2026-10-28).
+
 ## Remaining 13 failures (triaged, verified)
 
 - **PSEUDO RNG noise (~7)** — lsm basket/american/v2, joined hull_white,
