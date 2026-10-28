@@ -3,7 +3,34 @@
 ## Running Tests
 
 **CRITICAL:** JAX on gfx1151 (Strix Halo) pre-allocates GPU memory and causes OOM kills.
-Always set these environment variables before running pytest:
+This machine has **unified memory** — "GPU" memory is carved out of the same pool as
+system RAM, not a separate VRAM pool. JAX's own defaults (`PREALLOCATE=true`,
+`MEM_FRACTION=0.75`) grab ~75% of that pool on the *first JAX op of any process* —
+confirmed by measurement: a single trivial `10x10` matmul with no env vars set jumped
+system memory used from 10GB to 63GB, held for that process's entire lifetime
+regardless of actual computational need. One such process is tolerable; several run
+concurrently (e.g. parallel test/agent runs) will exhaust the box and OOM-kill
+unrelated programs.
+
+**As of 2026-09-08, this is now defended automatically in two layers** (both
+`setdefault`, so an explicit export before a command always wins):
+1. `.venv/lib/python3.12/site-packages/sitecustomize.py` — auto-loaded by Python on
+   *every* interpreter startup in this venv, so ad-hoc `uv run python3 -c "..."`
+   scripts are protected even with zero env vars set. The live copy inside `.venv`
+   is NOT tracked by git/uv, so a `uv sync --reinstall` or fresh venv loses it —
+   the source of truth is the tracked `scripts/sitecustomize.py`; reinstall with:
+   ```bash
+   bash scripts/install_sitecustomize.sh
+   ```
+2. `conftest.py` — same two lines, so pytest runs are protected even if
+   `sitecustomize.py` is ever lost.
+
+Both now default to `MEM_FRACTION=0.4` (~22GB, between the "safe" and "medium"
+tiers below) rather than the higher tiers previously recommended by default —
+deliberately conservative so several concurrent processes don't add up past
+system RAM. For a single heavy run that actually needs more, explicitly export
+a higher value first (it overrides the default); the manual-export table below
+still applies for that case:
 
 ```bash
 # Low memory (safe, ~14GB): MEM_FRACTION=0.25
