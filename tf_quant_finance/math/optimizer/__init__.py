@@ -166,12 +166,33 @@ def nelder_mead_minimize(function, initial_vertex=None, initial_position=None,
 
 
 def converged_all(losses, tolerance=1e-8, *args, **kw):
-    """tfp.optimizer.converged_all: True when all values are within tolerance."""
-    return jnp.all(jnp.abs(jnp.asarray(losses)) < tolerance)
+    """tfp.optimizer.converged_all stopping condition.
+
+    Dispatches on usage: tff's conjugate_gradient calls this as
+    ``converged_all(converged_flags, failed_flags)`` with boolean tensors —
+    per its docstring the loop stops when ALL batch members have either
+    converged or failed. The numeric form (all |losses| < tolerance) is kept
+    for direct tfp-style calls.
+    """
+    losses = jnp.asarray(losses)
+    if losses.dtype == jnp.bool_:
+        failed = jnp.asarray(tolerance)
+        return jnp.all(losses | failed)
+    return jnp.all(jnp.abs(losses) < tolerance)
 
 
 def converged_any(losses, tolerance=1e-8, *args, **kw):
-    return jnp.any(jnp.abs(jnp.asarray(losses)) < tolerance)
+    """tfp.optimizer.converged_any stopping condition.
+
+    Boolean-flag form (tff CG convention): stops as soon as one batch member
+    has converged, or when all have failed. Numeric form: any |loss| <
+    tolerance.
+    """
+    losses = jnp.asarray(losses)
+    if losses.dtype == jnp.bool_:
+        failed = jnp.asarray(tolerance)
+        return jnp.any(losses) | jnp.all(failed)
+    return jnp.any(jnp.abs(losses) < tolerance)
 
 
 class _LineSearchNS:

@@ -53,8 +53,13 @@ def _backtracking_ls(ls_func, value_at_zero=None, converged=None,
     init_alpha = initial_step_size
     init_step = ls_func(init_alpha)
     def ls_cond(alpha, step):
-        # Scalar reduction for batch: all elements must satisfy Armijo.
-        return jnp.all(jnp.logical_and(
+        # Scalar reduction for batch: shrink until ALL elements satisfy
+        # Armijo, i.e. keep shrinking while ANY element still violates it
+        # (each element has its own alpha; the shrink applies to all).
+        # NB: the previous `jnp.all` here exited as soon as ONE element was
+        # satisfied, accepting un-safeguarded steps for the rest of the
+        # batch (himmelblau batch runs diverged to NaN).
+        return jnp.any(jnp.logical_and(
             step.f > f0 + sufficient_decrease_param * alpha * df0,
             alpha > 1e-30))
     def ls_body(alpha, step):

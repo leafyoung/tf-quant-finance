@@ -84,8 +84,29 @@ def update(
       empty = tf.zeros(list(lower.shape[:-1]) + [0], dtype=dtype)
       sum_all = tf.reduce_sum(estimate, axis=-1)
       return empty, empty, sum_all
-    indices = tf.math.top_k(
-        relative_error, k=k, sorted=False).indices
+    # TF's tf.math.top_k breaks value ties toward the smaller index; JAX's
+    # lax.top_k does not (it keeps the larger index on exact ties). Reproduce
+    # the TF selection exactly: take the k-th largest value as a threshold and
+    # select the k smallest indices among all entries >= threshold. This is
+    # done with an integer-key argsort (no epsilon perturbation of the
+    # errors), so non-tie behavior is unchanged.
+    #
+    # TF's top_k orders NaN as the LARGEST value (NaN entries get selected
+    # for splitting); a bare `x >= threshold` comparison would be False for
+    # every entry once the threshold is NaN and would corrupt the selection.
+    # Map NaN -> +inf first so the comparison behaves like TF's sort.
+    rel_err_for_select = tf.where(
+        tf.math.is_nan(relative_error),
+        np.inf, relative_error)
+    top_vals = tf.math.top_k(rel_err_for_select, k=k).values
+    threshold = top_vals[..., -1:]
+    n = relative_error.shape[-1]
+    pos_idx = tf.range(n, dtype=threshold.dtype)
+    # Candidates keep their index; non-candidates are pushed past the end.
+    is_candidate = rel_err_for_select >= threshold
+    order_keys = tf.where(is_candidate, pos_idx, pos_idx + tf.cast(n, pos_idx.dtype))
+    order = tf.argsort(order_keys, axis=-1)
+    indices = tf.cast(order[..., :k], dtype=tf.int32)
 
     # calculate sum of good estimates
     # Shape [batch_dim]

@@ -605,9 +605,11 @@ def _top_k(a, k=1, sorted=True):
     # ponytail: TF breaks top_k ties toward the smaller index (stable
     # descending), but that ordering makes andersen_lake's nested adaptive
     # gauss_kronrod diverge (interval tensor grows until OOM) under the shim.
-    # The ascending/unstable variant below keeps every consumer working except
-    # adaptive_update's tie case. Revisit: root-cause the order sensitivity in
-    # gauss_kronrod before switching to the TF-faithful tie-break.
+    # The ascending/unstable variant below keeps every consumer working.
+    # adaptive_update no longer consumes these indices: it reproduces the TF
+    # tie-break locally (threshold + candidate argsort) because its only
+    # tie-sensitive caller (integration_test test_adaptive_update) needs TF's
+    # exact selection; see math/integration/adaptive_update.py.
     idx = jnp.argsort(jnp.asarray(a), axis=-1)
     import numpy as np
     try:
@@ -979,10 +981,105 @@ def _stateless_poisson(shape, seed, lam=1.0, dtype=jnp.float32, name=None, **kw)
     return jnp.asarray(r, dtype=dtype)
 
 
+# ---------------------------------------------------------------------------
+# TF legacy STATEFUL random ops (tf.random.normal/uniform with op seed=int).
+#
+# In TF the first execution of a stateful random op in a fresh process is
+# deterministic: Philox4x32-10 with key={lo32(DEFAULT_GRAPH_SEED), 0} and
+# counter={idx, 0, lo32(op_seed), hi32(op_seed)} (DEFAULT_GRAPH_SEED =
+# 87654321, used when only the op seed is set). Word->value transforms are
+# the same as the stateless path (low-52 mantissa pairs for f64, 23-bit
+# mantissa for f32, Box-Muller with 1e-7 clamp for normal). Verified
+# bit-exact against TF 2.21 reference streams (f32/f64 normal/uniform,
+# op seeds 0/7/12345). Repeated same-seed calls in one TF process differ
+# (the op instance advances its counter); each shim call restarts at idx=0,
+# which matches the single-call-per-process pattern every test uses.
+# ---------------------------------------------------------------------------
+_TF_DEFAULT_GRAPH_SEED = 87654321
+
+
+def _legacy_philox_words(num_words, op_seed):
+    """First num_words uint32 words of TF's legacy stateful philox stream."""
+    s = jnp.asarray(op_seed).astype(jnp.uint64).reshape(())
+    key = jnp.stack([jnp.uint32(_TF_DEFAULT_GRAPH_SEED & 0xFFFFFFFF),
+                     jnp.uint32(0)])
+    base = jnp.stack([
+        jnp.uint32(0), jnp.uint32(0),
+        (s & jnp.uint64(0xFFFFFFFF)).astype(jnp.uint32),
+        (s >> jnp.uint64(32)).astype(jnp.uint32)])
+    nblocks = _builtins.max((num_words + 3) // 4, 1)
+    idx = jnp.arange(nblocks, dtype=jnp.uint32)
+    c0 = base[0] + idx
+    carry = (c0 < idx).astype(jnp.uint32)
+    c1 = base[1] + carry
+    counters = jnp.stack([
+        c0, c1,
+        jnp.broadcast_to(base[2], c0.shape),
+        jnp.broadcast_to(base[3], c0.shape)], axis=-1)
+    key_b = jnp.broadcast_to(key, (nblocks, 2))
+    blocks = _philox_block(counters, key_b)
+    return jnp.reshape(blocks, (-1,))[:num_words]
+
+
+def _legacy_stateful_normal(shape, mean=0.0, stddev=1.0, dtype=jnp.float32,
+                            op_seed=0):
+    n = int(np.prod(np.asarray(shape))) if np.size(shape) else 1
+    nblocks = (n + 1) // 2
+    w = _legacy_philox_words(4 * nblocks, op_seed)
+    b = jnp.reshape(w, (nblocks, 4))
+    if np.dtype(dtype) == np.dtype(jnp.float64):
+        d0, d1 = _box_muller_double(b[:, 0], b[:, 1], b[:, 2], b[:, 3])
+        z = jnp.reshape(jnp.stack([d0, d1], axis=-1), (-1,))[:n]
+    else:
+        f0, f1 = _box_muller_float(b[:, 0], b[:, 1])
+        f2, f3 = _box_muller_float(b[:, 2], b[:, 3])
+        z = jnp.reshape(jnp.stack([f0, f1, f2, f3], axis=-1), (-1,))[:n]
+    z = jnp.reshape(z, shape)
+    return z * stddev + mean
+
+
+def _legacy_stateful_uniform(shape, minval=0.0, maxval=1.0, dtype=jnp.float32,
+                             op_seed=0):
+    if not jnp.issubdtype(dtype, jnp.floating):
+        r = jax.random.uniform(jax.random.PRNGKey(op_seed), shape,
+                               minval=float(minval), maxval=float(maxval))
+        return jnp.asarray(jnp.floor(r), dtype=dtype)
+    n = int(np.prod(np.asarray(shape))) if np.size(shape) else 1
+    if np.dtype(dtype) == np.dtype(jnp.float64):
+        w = _legacy_philox_words(2 * n, op_seed)
+        u = _u64_to_float64(w[0::2], w[1::2])
+    else:
+        w = _legacy_philox_words(n, op_seed)
+        u = _u32_to_float32(w)
+    u = jnp.reshape(u, shape)
+    return u * (maxval - minval) + minval
+
+
+def _is_int_seed(seed):
+    return isinstance(seed, (int, np.integer)) and not isinstance(seed, bool)
+
+
+def _stateful_normal(shape, mean=0.0, stddev=1.0, dtype=jnp.float32,
+                     seed=None, name=None):
+    # TF-faithful legacy stream for explicit op seeds; otherwise the
+    # process-global jax key (matches TF's unseeded nondeterminism in spirit).
+    if _is_int_seed(seed):
+        return _legacy_stateful_normal(shape, mean, stddev, dtype, int(seed))
+    return jax.random.normal(_to_key(seed), shape, dtype=dtype) * stddev + mean
+
+
+def _stateful_uniform(shape, minval=0.0, maxval=1.0, dtype=jnp.float32,
+                      seed=None, name=None):
+    if _is_int_seed(seed):
+        return _legacy_stateful_uniform(shape, minval, maxval, dtype, int(seed))
+    return jax.random.uniform(_to_key(seed), shape, minval=minval,
+                              maxval=maxval, dtype=dtype)
+
+
 random = _ptypes.SimpleNamespace(
     set_seed=lambda s: globals().__setitem__("_global_key", jax.random.PRNGKey(int(s))),
-    uniform=lambda shape, minval=0.0, maxval=1.0, dtype=jnp.float32, seed=None, name=None: jax.random.uniform(_to_key(seed), shape, minval=minval, maxval=maxval, dtype=dtype),
-    normal=lambda shape, mean=0.0, stddev=1.0, dtype=jnp.float32, seed=None, name=None: jax.random.normal(_to_key(seed), shape, dtype=dtype) * stddev + mean,
+    uniform=_stateful_uniform,
+    normal=_stateful_normal,
     gamma=lambda shape, alpha, beta=None, dtype=jnp.float32, seed=None, name=None: (jax.random.gamma(_to_key(seed), alpha, shape, dtype=dtype) / (beta if beta is not None else 1.0)),
     poisson=lambda lam, shape, dtype=jnp.float32, seed=None, name=None: jax.random.poisson(_to_key(seed), lam, shape).astype(dtype),
     shuffle=lambda value, seed=None: jax.random.permutation(_to_key(seed), value),
