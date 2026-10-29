@@ -653,7 +653,8 @@ class VectorHullWhiteModel(generic_ito_process.GenericItoProcess):
     params = [self._mean_reversion, self._volatility]
     if self._corr_matrix is not None:
       params = params + [self._corr_matrix]
-    times, keep_mask = _prepare_grid(
+    requested_times = times
+    times, _, time_indices = _prepare_grid(
         times, times_grid, *params)
     # Add zeros as a starting location
     dt = times[1:] - times[:-1]
@@ -713,65 +714,19 @@ class VectorHullWhiteModel(generic_ito_process.GenericItoProcess):
     # Initial state
     initial_x = tf.zeros((num_samples, self._dim), dtype=self._dtype)
     f0_t = self._instant_forward_rate_fn(times[0])
-    # Prepare results format
-    written_count = 0
-    if isinstance(num_requested_times, int) and num_requested_times == 1:
-      record_samples = False
-      rate_paths = initial_x + f0_t
-    else:
-      # If more than one sample has to be recorded, create a TensorArray
-      record_samples = True
-      element_shape = initial_x.shape
-      rate_paths = tf.TensorArray(dtype=times.dtype,
-                                  size=num_requested_times,
-                                  element_shape=element_shape,
-                                  clear_after_read=False)
-      # Include initial state, if necessary
-      rate_paths = rate_paths.write(written_count, initial_x + f0_t)
-    written_count += tf.cast(keep_mask[0], dtype=tf.int32)
-    # Define sampling while_loop body function
-    def cond_fn(i, written_count, *args):
-      # It can happen that `times_grid[-1] > times[-1]` in which case we have
-      # to terminate when `written_count` reaches `num_requested_times`
-      del args
-      return tf.math.logical_and(i < tf.size(dt),
-                                 written_count < num_requested_times)
-    def body_fn(i, written_count, current_x, rate_paths):
-      """Simulate hull-white process to the next time point."""
-      if normal_draws is None:
-        normals = random.mv_normal_sample(
-            (num_samples,),
-            mean=tf.zeros((self._dim,), dtype=mean_reversion.dtype),
-            random_type=random_type, seed=seed)
-      else:
-        normals = normal_draws[i]
-
-      if corr_matrix_root is not None:
-        normals = tf.linalg.matvec(corr_matrix_root[i], normals)
-      vol_x_t = tf.math.sqrt(tf.nn.relu(tf.transpose(var_x_t)[i]))
-      # If numerically `vol_x_t == 0`, the gradient of `vol_x_t` becomes `NaN`.
-      # To prevent this, we explicitly set `vol_x_t` to zero tensor at zero
-      # values so that the gradient is set to zero at this values.
-      vol_x_t = tf.where(vol_x_t > 0.0, vol_x_t, 0.0)
-      next_x = (tf.math.exp(-tf.transpose(mean_reversion)[i + 1] * dt[i])
-                * current_x
-                + tf.transpose(exp_x_t)[i]
-                + vol_x_t * normals)
-      f_0_t = self._instant_forward_rate_fn(times[i + 1])
-
-      # Update `rate_paths`
-      if record_samples:
-        rate_paths = rate_paths.write(written_count, next_x + f_0_t)
-      else:
-        rate_paths = next_x + f_0_t
-      written_count += tf.cast(keep_mask[i + 1], dtype=tf.int32)
-      return (i + 1, written_count, next_x, rate_paths)
+    # Whether the paths have to be recorded at every requested time (vs only
+    # the final state). The recording itself is done by the jax.lax.scan below,
+    # which records every grid point and gathers `requested_times` from the
+    # grid (see the alignment note at the gathering site); the legacy
+    # TensorArray + keep-mask machinery this flag used to drive is gone.
+    record_samples = not (isinstance(num_requested_times, int)
+                          and num_requested_times == 1)
 
     # TODO(b/157232803): Use tf.cumsum instead?
     # Sample paths using scan (differentiable)
     import jax
     import jax.numpy as jnp
-    
+
     steps_num = len(dt)
     
     def _draw(i):
@@ -797,45 +752,51 @@ class VectorHullWhiteModel(generic_ito_process.GenericItoProcess):
     if not record_samples:
       # Just compute final state
       def scan_body(carry, i):
-        return _step(i, carry), None
+        return _step(i, carry).astype(carry.dtype), None
       final_x, _ = jax.lax.scan(scan_body, initial_x, xs=jnp.arange(steps_num))
       f_0_t = self._instant_forward_rate_fn(times[-1])
       rate_paths = final_x + f_0_t
       # shape [num_samples, 1, dim]
       return tf.expand_dims(rate_paths, axis=-2)
     
-    # Record samples: scan steps_num, carrying (state, result[num_requested, ...], wc)
-    result = tf.zeros([num_requested_times] + list(initial_x.shape), dtype=self._dtype)
-    wc = jnp.asarray(0, dtype=jnp.int32)
-    # Record the initial state at slot 0 if requested (keep_mask[0]).
+    # Record the state at every grid point, then gather the requested times.
+    # Gathering by grid position (instead of sequentially appending at a
+    # moving write counter gated by a keep-mask) keeps the output aligned
+    # with `requested_times` even when the requested times contain
+    # duplicates: each requested time reads the value recorded at its own
+    # grid position, and duplicate requested times repeat the same recorded
+    # value. Sequential recording instead collapses duplicate times through
+    # the keep-mask (built via searchsorted + scatter_nd), misaligns all
+    # subsequently recorded slots and silently leaves the trailing slots
+    # unwritten (zeros) whenever a requested time collides exactly with
+    # another one (e.g. a swaption expiry sitting on the `time_step` grid).
     f_0_t_init = self._instant_forward_rate_fn(times[0])
-    rec0 = jnp.asarray(keep_mask[0], dtype=jnp.int32)
-    result = jnp.where(rec0 == 1, result.at[0].set(initial_x + f_0_t_init), result)
-    wc = wc + rec0
-    
-    def body_rec(carry, i):
-      state, result, wc = carry
-      next_state = _step(i, state)
+
+    def body_rec(current_x, i):
+      # jax.lax.scan calls body(carry, x): the carry is the short-rate state,
+      # x is the grid-step index. (The previous argument order was swapped,
+      # which made every multi-time simulation path index tensors with the
+      # float64 state array.)
+      next_state = _step(i, current_x)
       f_0_t = self._instant_forward_rate_fn(times[i + 1])
-      next_path = next_state + f_0_t
-      rec = jnp.asarray(keep_mask[i + 1], dtype=jnp.int32)
-      # Use dynamic_update_slice for traced index wc
-      update = jnp.expand_dims(next_path, 0)
-      # Ensure update has the same dtype as result
-      update = update.astype(result.dtype)
-      wc_int = wc.astype(jnp.int64)
-      slice_indices = (wc_int,) + (jnp.int64(0),) * (result.ndim - 1)
-      new_result = jax.lax.dynamic_update_slice(result, update, slice_indices)
-      result = jnp.where(rec == 1, new_result, result)
-      wc = wc + rec
-      # Ensure state dtype matches for scan carry consistency
-      return (next_state.astype(state.dtype), result, wc), None
-    
-    (_, result, _), _ = jax.lax.scan(
-        body_rec, (initial_x, result, wc), xs=jnp.arange(steps_num))
-    # result.shape = [num_requested_times, num_samples, dim]
+      # Some RNG backends (e.g. the shim's HALTON) return float64 normals even
+      # for float32 models, and jnp promotion would silently widen the recorded
+      # paths. The legacy TensorArray cast every write to the element dtype —
+      # replicate that: recorded paths stay in the model dtype.
+      next_state = next_state.astype(current_x.dtype)
+      return next_state, next_state + f_0_t
+
+    _, recorded = jax.lax.scan(
+        body_rec, initial_x, xs=jnp.arange(steps_num))
+    # Shape [steps_num + 1] + [num_samples, dim]: `grid_paths[k]` is the
+    # short rate at grid time `times[k]`; `grid_paths[0]` is the initial
+    # state at `times[0]`.
+    grid_paths = tf.concat(
+        [tf.expand_dims(initial_x + f_0_t_init, axis=0), recorded], axis=0)
+    # Shape [num_requested_times, num_samples, dim]
+    rate_paths = tf.gather(grid_paths, time_indices, axis=0)
     # transpose to [num_samples, num_requested_times, dim]
-    rate_paths = tf.transpose(result, [1, 0, 2])
+    rate_paths = tf.transpose(rate_paths, [1, 0, 2])
     return rate_paths
 
   def _bond_reconstitution(self,
@@ -1085,7 +1046,7 @@ def _prepare_grid(times, times_grid, *params):
       indices=tf.expand_dims(tf.cast(time_indices, dtype=tf.int64), axis=1),
       updates=tf.fill(tf.shape(times), True),
       shape=tf.shape(all_times, out_type=tf.int64))
-  return all_times, mask
+  return all_times, mask, time_indices
 
 
 def _input_type(param, dim, dtype, name):
