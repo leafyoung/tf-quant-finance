@@ -126,20 +126,107 @@ mean (24 passed), lsm basket/american/v2 (16 passed), joined hull_white
 (3 passed). mc_pricing ×2 now pass (calibration module 21/21), most likely
 via fix 2 (the default CG optimizer used to burn its iterations).
 
+## Test-pollution root cause + TF-oracle session (2026-10-30)
+
+### 1. Order-dependent MC test failure: root-caused and fixed (conftest)
+
+`hull_white/zero_coupon_bond_option_test.py::test_correctness_time_dep_simulation`
+SUBFAILed on Price (0.02251 vs 0.02237839, atol=1e-4) only in some module
+batches — passed solo, passed in the full suite. NOT x64, NOT a shim dtype
+cache: the test prices via `PSEUDO_ANTITHETIC` with `seed=None`, which maps to
+the shim's process-global `_global_key` (`tf.random.normal` → `_next_key()`).
+Every earlier test that consumes an unseeded normal draw advances the key, so
+the sampled paths — and the MC price — depend on which tests ran before.
+The expected price encodes the fresh-process stream; across stream positions
+the price scatters by ~±1e-4 (direct experiment: fresh 0.022457, +1 draw
+0.022362, +2 draws 0.022426), so some positions fall outside atol=1e-4.
+This mirrors REAL TF semantics: TF's unseeded stateful RNG is also
+process-global and order-dependent (verified: fresh processes differ, prior
+draws shift the stream). Upstream never hit it because Bazel ran each test
+file in its own process.
+
+FIX: autouse `_reset_unseeded_rng_stream` fixture in `conftest.py` resets
+`_tf._global_key = PRNGKey(0)` before every test (guarded for the TF env) —
+each test sees the fresh-process stream, i.e. in-process reproduction of
+upstream's per-file process isolation. No test expectations touched.
+Verified: bond-option file alone green; hull_white+hjm+longstaff_schwartz
+batch (previously SUBFAILing) green twice in a row.
+
+### 2. TF-oracle verdicts on the parked hagan_west/svi items
+
+Method: pristine pre-migration code (commit 39aa6271, parent of the shim
+commit) extracted to /tmp and run under the real-TF `.venv-tf`
+(TF 2.21 CPU + tfp 0.25). Two artifacts discovered in the original baseline:
+
+- The TF baseline itself never ran these tests: the original
+  `hagan_west/__init__.py` rebinds `bond_curve = bond_curve_lib.bond_curve`
+  (the FUNCTION) shadowing the submodule, so `bond_curve.bond_curve(...)` in
+  the tests raised `AttributeError` — the earlier claim "the whole bond_curve
+  module also fails under real TF" (see the parked list below) was this
+  import artifact, not TF semantics.
+- With the import fixed, the ONLY real-TF failure in hagan_west is
+  `test_zero_coupon_bond_{single,double}` — a TF-2.21/numpy `TypeError
+  (only 0-dimensional arrays can be converted to Python scalars)` in test
+  code, also an environment artifact.
+
+Per-test verdicts with the working oracle:
+
+- **`test_unstable` ×2 (STAYS PARKED, sharper evidence).** Under real TF the
+  test PASSES: TF's iteration genuinely diverges on the 500%-rate inputs
+  (converged=False, failed=True, NaN at specific indices). Our port, with the
+  domain-guard added in 2e70805d (needed for flat_curve/negative_rates f32),
+  instead converges to a FALSE fixed point (rates [5.02, 5.05, 5.08, 5.07]
+  that do NOT reproduce the pvs; true rates [5.0, 4.75, 4.53, 4.78]).
+  Reverting to the pristine algorithm (guards removed) makes 16/36 tests
+  fail — our f32/f64 op-level numerics differ from TF's Eigen kernels by more
+  than last-bit in this chaotic iteration, so the guard is load-bearing.
+  Matching TF's exact NaN pattern would require bit-identical chaotic
+  dynamics — unfixable by design. Two defects of the current state are now
+  on record: the divergence-vs-false-convergence semantic gap, and that the
+  false fixed point is silently wrong.
+- **`negative_forwards_single_precision` (STAYS FAILING, settled).** TF 2.21
+  converges in EXACTLY 6 iterations in float32 in this environment — the
+  test's `iterations == 6` is the real TF behavior, not a version-specific
+  quirk. Our port takes 7: the per-iteration f32 trajectories are
+  bit-identical through iteration 1, then jnp vs TF-Eigen transcendentals
+  (log/exp) diverge by 1-2 ULP; TF's iteration-6 max rate delta lands at
+  exactly 0.0, ours at 2.7e-8 — just above the 1e-8 tolerance — forcing one
+  more iteration. Convergence semantics are otherwise identical (converged
+  True, failed False, rates to 1e-6). Not fixable without bit-matching TF's
+  f32 kernels; the exact count is last-bit sensitive, not a statistical
+  property.
+- **svi `test_weights_to_handle_outliers` (FIXED — expectation updated).**
+  The TF/tfp oracle PASSES the original test, i.e. tfp's BFGS genuinely does
+  not converge on the outlier-degraded objective: the
+  `assertFalse(converged.all())` assertion encoded a tfp-optimizer failure
+  mode, not an SVI property. Our scipy L-BFGS-B converges, but to a
+  degenerate optimum with SVI-INVALID parameters (a ≈ −5.4e5,
+  |rho| ≈ 1.86 > 1) — the outliers still destroy the unweighted fit. The
+  subtest was replaced by 'Model with outliers did not produce a usable fit',
+  accepting either honest failure mode (non-convergence OR convergence to an
+  invalid |rho| ≥ 1 fit); the surrounding subtests (unweighted fit ≠ true
+  parameters, zero-weighted fit converges to true parameters) are unchanged.
+  Rationale recorded here per the test-expectation-change rule.
+
 ## Remaining failures (triaged, verified 2026-10-29)
+
 
 Full-suite verified set (6 failed, 1347 passed, 49 min, command below):
 
 - **hagan_west bond_curve `test_unstable` ×2 (parked)** — deliberately
   pathological inputs (500% rates); the test asserts TF's exact divergence
   pattern (`converged=False`, NaN at specific rate indices). Our port
-  CONVERGES where TF diverged — the divergence is chaotic (bifurcation-
-  boundary) and the whole bond_curve module also fails under real TF 2.21
-  CPU (see baseline_tf.txt: nearly every subtest). Not fixable without
-  deliberately breaking our solver; parked.
+  CONVERGES (to a false fixed point) where TF diverged — see the 2026-10-30
+  TF-oracle session above for the corrected evidence: the earlier claim that
+  "the whole bond_curve module also fails under real TF" was an import
+  artifact of the baseline run; TF passes everything except a TF-2.21/numpy
+  TypeError in test_zero_coupon_bond. Matching TF's NaN pattern requires
+  bit-identical chaotic dynamics; parked.
 - **hagan_west `negative_forwards_single_precision` (left failing)** —
-  converges correctly but takes 7 iterations in float32 where TF took 6;
-  the exact iteration count is last-bit sensitive in single precision, not a
+  converges correctly but takes 7 iterations in float32 where TF 2.21
+  (verified by oracle, 2026-10-30) takes 6: 1-2 ULP jnp-vs-Eigen differences
+  push our iteration-6 max delta to 2.7e-8, just above the 1e-8 tolerance.
+  The exact iteration count is last-bit sensitive in single precision, not a
   statistical property. Left failing with note.
 - **hull_white swaption 2d_batch_simulation (parked)** — batch MC with
   pre-expiry payments; negative-tau handling prices the payer swaption at 0
@@ -147,12 +234,12 @@ Full-suite verified set (6 failed, 1347 passed, 49 min, command below):
   Needs TF-source semantic comparison (parked; unchanged this session).
 - **halton `test_many_small_batches_same_as_one_big_batch` (flaky)** —
   known run-dependent; passed in some earlier full runs.
-- **svi `test_weights_to_handle_outliers` (parked)** — the test asserts the
-  UNWEIGHTED fit must NOT converge on outlier data
-  (`assertFalse(converged.all())`); the shim's `bfgs_minimize` is scipy
-  L-BFGS-B, which converges where tfp's BFGS genuinely did not. The
-  assertion encodes tfp-BFGS-specific failure behavior, not a statistical
-  property; making it pass would mean deliberately weakening the optimizer.
+- **svi `test_weights_to_handle_outliers` (FIXED 2026-10-30, expectation
+  updated)** — see the TF-oracle session above: the original
+  `assertFalse(converged.all())` encoded tfp-BFGS's genuine failure mode
+  (verified: the pristine test passes under real tfp 0.25); replaced by an
+  assertion accepting either non-convergence or convergence to an
+  SVI-invalid (|rho| ≥ 1) fit.
   (The separately deselected svi real-market-data CG test remains
   deselected as before.)
 

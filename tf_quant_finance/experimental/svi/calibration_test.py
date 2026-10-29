@@ -162,8 +162,20 @@ class SimulatedDataCalibrationTest(parameterized.TestCase, tf.test.TestCase):
             volatilities=volatilities,
             weights=weights,
             optimizer_fn=tfp.optimizer.bfgs_minimize))
-    with self.subTest('Model with outliers did not converge'):
-      self.assertFalse(converged.all())
+    with self.subTest('Model with outliers did not produce a usable fit'):
+      # Upstream asserted tfp-BFGS's NON-CONVERGENCE on this outlier-degraded
+      # objective. Verified against the TF 2.21 oracle (pristine code +
+      # .venv-tf): the original test passes under tfp precisely because its
+      # BFGS genuinely fails to converge here — the assertion encodes a
+      # tfp-optimizer failure mode, not an SVI property. The migrated
+      # scipy L-BFGS-B does converge, but to a degenerate optimum with
+      # SVI-invalid parameters (a ~ -5.4e5, |rho| ~ 1.86 > 1): the outliers
+      # still destroy the unweighted fit. Accept either honest failure mode:
+      # non-convergence, or convergence to an invalid (|rho| >= 1) fit.
+      fit_is_usable = (
+          np.all(np.asarray(converged)) and
+          np.all(np.abs(np.asarray(model_parameters)[..., 3]) < 1.0))
+      self.assertFalse(fit_is_usable)
     with self.subTest('Parameters incorrect for model with outliers'):
       self.assertNotAllClose(
           model_parameters, true_parameters, atol=1e-4, rtol=1e-3)
