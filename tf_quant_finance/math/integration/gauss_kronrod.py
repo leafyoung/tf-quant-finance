@@ -103,6 +103,7 @@ def gauss_kronrod(func: Callable[[types.FloatTensor], types.FloatTensor],
                   tolerance: float,
                   num_points: int = 21,
                   max_depth: int = 20,
+                  max_intervals: int = 65536,
                   dtype: Optional[tf.DType] = None,
                   name: Optional[str] = None) -> types.FloatTensor:
   """Evaluates definite integral using adaptive Gauss-Kronrod quadrature.
@@ -150,6 +151,19 @@ def gauss_kronrod(func: Callable[[types.FloatTensor], types.FloatTensor],
       Implemented for 15,21,31. Default value: 21.
     max_depth: Maximum number of times to divide intervals into two parts and
       recalculate Gauss-Kronrod on them. Default value: 20.
+    max_intervals: Positive `int`. Safety bound on the number of simultaneously
+      tracked sub-intervals of the adaptive recursion. The relative-error
+      criterion is unsatisfiable for some integrands (e.g. where the Kronrod
+      and Legendre estimates agree only where the estimate is 0, or near a
+      singularity), in which case the recursion keeps almost all intervals
+      "bad" and the working set grows ~2x per depth until the
+      `[batch_dim, n, num_points]` evaluation tensors exhaust device memory.
+      Once the interval count exceeds `max_intervals`, the current intervals
+      are evaluated once more, their Kronrod estimates are accepted as final
+      and the subdivision stops (a finite, possibly less accurate result
+      instead of an OOM). Recursions that converge normally stay orders of
+      magnitude below the cap, so the bound is never reached and results are
+      unchanged. Default value: 65536.
     dtype: If supplied, the dtype for the `lower` and `upper`. Result will have
       the same dtype. Default value: None which maps to dtype of `lower`.
     name: The name to give to the ops created by this function. Default value:
@@ -211,6 +225,16 @@ def gauss_kronrod(func: Callable[[types.FloatTensor], types.FloatTensor],
       # Check if there are any intervals left
       n_intervals = cur_lower.shape[-1] if cur_lower.ndim > 0 else 1
       if n_intervals == 0:
+        break
+      if n_intervals > max_intervals:
+        # Divergence guard (see `max_intervals` in the docstring): subdivide
+        # no further. Evaluate the current intervals one last time and accept
+        # their Kronrod estimates as the final contribution. For recursions
+        # that converge normally this branch is never reached.
+        kronrod_result, _ = _non_adaptive_gauss_kronrod(
+            func, cur_lower, cur_upper, num_points, dtype, name)
+        estimate_result = estimate_result + tf.reduce_sum(
+            kronrod_result, axis=-1)
         break
       kronrod_result, func_results = _non_adaptive_gauss_kronrod(
           func, cur_lower, cur_upper, num_points, dtype, name)

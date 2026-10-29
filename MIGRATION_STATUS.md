@@ -99,10 +99,10 @@ Working tree left uncommitted for review. Per-change rationale:
    andersen_lake does not import adaptive_update (verified by grep + the
    full ExerciseBoundaryTest class passing in 72 s after this change at
    MEM_FRACTION=0.7).
-   NOTE: andersen_lake `BatchRank1_RAndSNone` OOM-thrashes (3.24 GiB
-   allocs, ~23 min, failure) at MEM_FRACTION=0.4 but passes in ~1 min at
-   0.7 — it is memory-pressure sensitive, not tie-break sensitive. Run the
-   full suite with the standard 0.8 fraction below.
+   NOTE (updated 2026-10-29): the 0.4-fraction OOM-thrash mentioned here was
+   later root-caused as an adaptive-Kronrod divergence, NOT memory pressure —
+   see the landmine below. This note's "andersen_lake does not import
+   adaptive_update" missed the transitive import via gauss_kronrod.
 4. **Stateful RNG: bit-exact TF legacy stream (`_tf.py`)** — `tf.random.normal/
    uniform(..., seed=int)` previously mapped to `jax.random.normal(PRNGKey(seed))`
    (a completely different stream). Reverse-engineered TF 2.21's legacy
@@ -190,15 +190,38 @@ notes above); the rest remain run-dependent.
 - `lax.while_loop` has no reverse-mode VJP: optimizers must fall back to
   2-point numerical gradients; the batch path needs separate value/grad fns
   (see `_run_quasi_newton`).
-- `_top_k` TF tie-break (smaller index on ties) diverges andersen_lake's
-  nested adaptive integration — root cause unknown; do not "fix" without
-  investigating gauss_kronrod's order sensitivity. adaptive_update now
-  reproduces the TF tie-break LOCALLY (safe: andersen_lake does not import
-  it), so _top_k itself stays as-is.
-- andersen_lake `ExerciseBoundaryTest` is memory-pressure sensitive: at
-  XLA_PYTHON_CLIENT_MEM_FRACTION=0.4 the 3.24 GiB interval allocations
-  OOM-thrash (~23 min, BatchRank1 fails); at 0.7+ the class passes in ~1
-  min. Use the standard 0.8 fraction from the command below.
+- `_top_k` TF tie-break (smaller index on ties) interacts with andersen_lake's
+  nested adaptive integration: the selection ORDER decides convergence of the
+  recursion (chaotic — see the landmine below). adaptive_update reproduces the
+  TF tie-break LOCALLY (safe for `test_adaptive_update`), and the recursion is
+  now bounded by gauss_kronrod's `max_intervals` guard, so neither ordering can
+  OOM anymore.
+- andersen_lake OOM landmine — ROOT-CAUSED + FIXED (2026-10-29). The old
+  "memory-pressure sensitive" note was wrong. Root cause: andersen_lake prices
+  two integrals via `gauss_kronrod` (tolerance 1e-11, max_depth=50); its
+  adaptive update splits the k worst intervals per depth, so the working set
+  can double every depth (n: 1, 2, 4, ...). The relative-error criterion
+  |kronrod−legendre|/|estimate| is unsatisfiable for some interval sets, and
+  whether the recursion hits that depends chaotically on the selection order /
+  micro-numerics (it flipped on/off across the top_k & convert_to_tensor
+  experiments). Diverging, it keeps ~90% of intervals bad each depth
+  (measured: n = 170 → 490 → 1436 → 213242 → 1195592) and each depth
+  materializes ~10-20 float64 tensors of shape [6, n, 31] (Kronrod points +
+  cubic-spline interpolation + ndtr intermediates) — at n≈1.2M that is a
+  1.66 GiB tensor per buffer and the BFC pool grows to its cap, dying with
+  RESOURCE_EXHAUSTED "trying to allocate 3.03 GiB" (the 2.37/3.03/3.24 GiB
+  figures in old notes are the same failure at different pool caps; the
+  thrash is the allocator retrying under the cap). Converged runs peak at
+  n=52 intervals / 33 MiB pool. FIX: `gauss_kronrod(..., max_intervals=65536)`
+  divergence guard — once the tracked interval count exceeds the cap, the
+  current intervals are evaluated once more, their Kronrod estimates accepted
+  as final, and subdivision stops (finite answer instead of OOM). The guard
+  is dormant for every convergent path: all 10 andersen_lake cases reproduce
+  bit-identical prices and interval sequences, integration tests unchanged.
+  With the guard, even the reconstructed divergent selection finishes with
+  bit-identical correct prices at a 4.0 GiB pool peak (was: 49.6 GiB →
+  RESOURCE_EXHAUSTED). `ExerciseBoundaryTest` passes at MEM_FRACTION=0.4
+  (module: 15 passed, 78 s; single BatchRank1_RAndSNone 29 s cold).
 
 ## Running tests
 
