@@ -53,4 +53,4 @@ Asian options, Heston, SABR, CIR, Hull-White, Brownian bridge, math primitives.
 
 - `MIGRATION_STATUS.md` — per-module pass rates, known issues
 - `MIGRATION_PLAN.md`, `BASELINE_TF.md` — strategy and TF baseline
-- `AGENT.md` — earlier version of this file (content folded here)
+
